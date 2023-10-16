@@ -1,103 +1,96 @@
-//import std;
-#include "LazyStream.h"
-#include <ranges>
-#include <string_view>
-#include <format>
-#include <print>
-#include <vector>
-#include <functional>
-#include <iostream>
-#include <numeric>
-#include <algorithm>
-#include <variant>
-#include <memory>
-#include "generator.h"
+import Parser;
+import std;
 
+using namespace StreamModule;
+using namespace ParserModule;
 using namespace std::literals;
 
-template <typename A>
-class Parser
+template <typename T>
+struct std::formatter<Stream<T>, wchar_t>
+    : std::formatter<T, wchar_t>
 {
-public:
-    using Func = std::function<Stream<std::tuple<A, std::wstring_view>>(std::wstring_view)>;
-
-    static auto Make(Func&& func)
+    template <typename FormatContext>
+    auto format(Stream<T> const& v, FormatContext& ctx) const
     {
-        return Parser<A>{ std::forward<Func>(func) };
-    }
+        auto out{ ctx.out() };
 
-    Parser() = default;
-
-    Parser(Func&& op)
-        : op{ std::forward<Func>(op) }
-    {
-        if (this->op == nullptr)
+        if constexpr (std::is_same_v<T, wchar_t>)
         {
-            assert(false);
+            std::ranges::copy(v, out);
         }
+        else
+        {
+            *out++ = L'[';
+
+            for (auto first{ true };
+                auto const& e : v)
+            {
+                if (!std::exchange(first, false))
+                {
+                    *out++ = L',';
+                }
+
+                out = std::format_to(out, L"{}", e);
+            }
+
+            *out++ = ']';
+        }
+
+        return out;
     }
-
-    Parser(Parser const&) = default;
-    Parser(Parser&&) = default;
-    Parser& operator=(Parser const&) = default;
-    Parser& operator=(Parser&&) = default;
-
-    Stream<std::tuple<A, std::wstring_view>> operator()(std::wstring_view inp) const
-    {
-        return op ? op(inp) : Stream<std::tuple<A, std::wstring_view>>{};
-    }
-
-private:
-    Func op;
 };
 
-template <typename B, typename A>
-using ParserLambda = std::function<Parser<B>(A)>;
-
-template <typename A>
-void Show(Stream<std::tuple<A, std::wstring_view>> v)
+template <typename... Ts>
+struct std::formatter<std::tuple<Ts...>, wchar_t>
 {
-    std::wcout << '[';
-
-    for (auto const& e : v
-        | std::views::transform([]<typename T>(T const& t) {
-            if constexpr (std::disjunction_v<std::is_constructible<std::wstring_view, std::tuple_element_t<0, T>>, std::is_same<Stream<wchar_t>, std::tuple_element_t<0, T>>>)
-            {
-                return std::format(L"(\"{}\",\"{}\")", std::get<0>(t), std::get<1>(t));
-            }
-            else
-            {
-                return std::format(L"({},\"{}\")", std::get<0>(t), std::get<1>(t));
-            }
-        })
-        | std::views::join_with(L","s)
-    )
+    template <typename FormatContext, std::size_t... Is>
+    void PrintTuple(FormatContext& ctx, std::tuple<Ts...> const& t, std::index_sequence<Is...>) const
     {
-        std::wcout << e;
+        auto out{ ctx.out() };
+        
+        *out++ = L'(';
+        ((Is == 0 ? out = std::format_to(out, L"{}", std::get<Is>(t)) : out = std::format_to(out, L",{}", std::get<Is>(t))), ...);
+        *out++ = L')';
     }
 
-    std::wcout << L"]\n";
-}
+    template <typename FormatContext>
+    auto format(std::tuple<Ts...> const& t, FormatContext& ctx) const
+    {
+        PrintTuple(ctx, t, std::make_index_sequence<sizeof...(Ts)>{});
 
-template <typename A>
-Parser<A> Result(A v)
-{
-    return Parser<A>::Make([v](std::wstring_view inp) -> Stream<std::tuple<A, std::wstring_view>> {
-        return Stream<std::tuple<A, std::wstring_view>>{ { v, inp } };
-    });
-}
+        return ctx.out();
+    }
 
-template <typename A>
-Parser<A> Zero()
+    constexpr auto parse(std::wformat_parse_context& ctx) -> decltype(std::begin(ctx))
+    {
+        auto it{ std::begin(ctx) };
+        auto e_it{ std::end(ctx) };
+
+        if (it != e_it and *it != L'}')
+        {
+            throw std::format_error{ "invalid format" };
+        }
+
+        return it;
+    }
+};
+
+Stream<std::tuple<int, int, int>> Triples()
 {
-    return Parser<A>::Make([](std::wstring_view) -> Stream<std::tuple<A, std::wstring_view>> {
-        return {};
-    });
+    return IntsFrom(1) >>= [](int z) {
+        return Ints(1, z) >>= [z](int x) {
+            return Ints(x, z) >>= [x, z](int y) {
+                return Mthen(Guard(x * x + y * y == z * z), [x, y, z] {
+                    return Mreturn(std::tuple{ x, y, z });
+                });
+            };
+        };
+    };
 }
 
 auto Item()
 {
-    return Parser<wchar_t>::Make([](std::wstring_view inp) -> Stream<std::tuple<wchar_t, std::wstring_view>> {
+    return Parser<wchar_t>::Make([](std::wstring_view inp) {
         if (std::empty(inp))
         {
             return Stream<std::tuple<wchar_t, std::wstring_view>>{};
@@ -115,37 +108,23 @@ template <typename A, typename B>
 auto Seq(Parser<A> pa, Parser<B> pb)
 {
     return Parser<std::tuple<A, B>>::Make([pa, pb](std::wstring_view inp) -> Stream<std::tuple<std::tuple<A, B>, std::wstring_view>> {
-        return Mbind(pa(inp), [pb](std::tuple<A, std::wstring_view> t1) {
+        return pa(inp) >>= [pb](std::tuple<A, std::wstring_view> t1) {
             auto const& [v, inp1] { t1 };
 
-            return Mbind(pb(inp1), [](std::tuple<B, std::wstring_view> t2) {
+            return pb(inp1) >>= [](std::tuple<B, std::wstring_view> t2) {
                 auto const& [w, inp2] { t2 };
 
                 return Mreturn(std::tuple{ std::tuple{ v, w }, inp2 });
-            });
-        });
-    });
-}
-
-template <typename A, typename B>
-auto Bind(Parser<A> p, std::function<Parser<B>(A)> f)
-{
-    return Parser<B>::Make([p, f](std::wstring_view inp) mutable -> Stream<std::tuple<B, std::wstring_view>> {
-        return Mbind(p(inp), [f](std::tuple<A, std::wstring_view> t1) {
-            auto [v, inp1] { t1 };
-
-            return Mbind(f(v)(inp1), [](std::tuple<B, std::wstring_view> t2) {
-                return Mreturn(t2);
-            });
-        });
+            };
+        };
     });
 }
 
 auto Sat(std::function<bool(wchar_t)> p)
 {
-    return Bind(Item(), ParserLambda<wchar_t, wchar_t>{ [p](wchar_t x) mutable {
+    return Item() >>= [p](wchar_t x) {
         return p(x) ? Result(x) : Zero<wchar_t>();
-    } });
+    };
 }
 
 auto Char(wchar_t x)
@@ -168,20 +147,6 @@ auto Upper()
     return Sat([](wchar_t x) { return L'A' <= x and x <= L'Z'; });
 }
 
-template <typename T>
-Stream<T> PlusPlus(Stream<T> stm1, Stream<T> stm2)
-{
-    return Concat(stm1, stm2);
-}
-
-template <typename A>
-Parser<A> Plus(Parser<A> pa1, Parser<A> pa2)
-{
-    return Parser<A>::Make([pa1, pa2](std::wstring_view inp) mutable -> Stream<std::tuple<A, std::wstring_view>> {
-        return PlusPlus<std::tuple<A, std::wstring_view>>(pa1(inp), pa2(inp));
-    });
-}
-
 auto Letter()
 {
     return Plus(Lower(), Upper());
@@ -194,11 +159,11 @@ auto AlphaNum()
 
 Parser<std::wstring> Word()
 {
-    auto ne_word{ Bind(Letter(), ParserLambda<std::wstring, wchar_t>{ [](wchar_t x) {
-        return Bind(Word(), ParserLambda<std::wstring, std::wstring>{ [x](std::wstring xs) {
+    auto ne_word{ Letter() >>= [](wchar_t x) {
+        return Word() >>= [x](std::wstring xs) {
             return Result(std::wstring{ x } + xs);
-        } });
-    } }) };
+        };
+    } };
 
     return Plus(ne_word, Result(L""s));
 }
@@ -213,11 +178,11 @@ Parser<std::wstring> String(std::wstring str)
     auto x{ str.front() };
     auto xs{ str.substr(1) };
 
-    return Bind(Char(x), ParserLambda<std::wstring, wchar_t>{ [x, xs](wchar_t x) {
-        return Bind(String(xs), ParserLambda<std::wstring, std::wstring>{ [x, xs](std::wstring) {
+    return Char(x) >>= [x, xs](wchar_t x) {
+        return String(xs) >>= [x, xs](std::wstring) {
             return Result(std::wstring{ x } + xs);
-        } });
-    } });
+        };
+    };
 }
 
 template <typename A>
@@ -226,32 +191,32 @@ Parser<Stream<A>> Many(Parser<A> p);
 //template <typename A>
 //Parser<Stream<A>> Many(Parser<A> p)
 //{
-//    auto ne_many{ Bind(p, ParserLambda<Stream<A>, A>{ [p](A x) {
-//        return Bind(Many(p), ParserLambda<Stream<A>, Stream<A>>{ [x](Stream<A> xs) {
+//    auto ne_many{ p >>= [p](A x) {
+//        return Many(p) >>= [x](Stream<A> xs) {
 //            return Result(Stream<A>{ x, xs });
-//        } });
-//    } }) };
+//        };
+//    } };
 //
 //    return Plus(ne_many, Result(Stream<A>{}));
 //}
 
 Parser<Stream<wchar_t>> Ident()
 {
-    return Bind(Lower(), ParserLambda<Stream<wchar_t>, wchar_t>{ [](wchar_t x) {
-        return Bind(Many(AlphaNum()), ParserLambda<Stream<wchar_t>, Stream<wchar_t>>{ [x](Stream<wchar_t> xs) {
+    return Lower() >>= [](wchar_t x) {
+        return Many(AlphaNum()) >>= [x](Stream<wchar_t> xs) {
             return Result(Stream<wchar_t>{ x, xs });
-        } });
-    } });
+        };
+    };
 }
 
 template <typename A>
 Parser<Stream<A>> Many1(Parser<A> p)
 {
-    return Bind(p, ParserLambda<Stream<A>, A>{ [p](A x) {
-        return Bind(Many(p), ParserLambda<Stream<A>, Stream<A>>{ [x](Stream<A> xs) {
+    return p >>= [p](A x) {
+        return Many(p) >>= [x](Stream<A> xs) {
             return Result(Stream<A>{ x, xs });
-        } });
-    } });
+        };
+    };
 }
 
 template <typename Func, typename T>
@@ -289,11 +254,11 @@ Parser<int> Nat();
 Parser<int> Int()
 {
     return Plus(
-        Bind(Char(L'-'), ParserLambda<int, wchar_t>{ [](wchar_t) {
-            return Bind(Nat(), ParserLambda<int, int>{ [](int n) {
+        Char(L'-') >>= [](wchar_t) {
+            return Nat() >>= [](int n) {
                 return Result(-n);
-                } });
-            } }),
+                };
+            },
         Nat()
     );
 }
@@ -301,33 +266,33 @@ Parser<int> Int()
 template <typename A, typename B>
 Parser<Stream<A>> SepBy1(Parser<A> p, Parser<B> sep)
 {
-    return Bind(p, ParserLambda<Stream<A>, A>{ [p, sep](A x) {
+    return p >>= [p, sep](A x) {
         auto many{
             Many(
-                Bind(sep, ParserLambda<A, B>{ [p](B) {
-                    return Bind(p, ParserLambda<A, A>{ [](A y) {
+                sep >>= [p](B) {
+                    return p >>= [](A y) {
                         return Result(y);
-                    } });
-                } })
+                    };
+                }
             )
         };
 
-        return Bind(many, ParserLambda<Stream<A>, Stream<A>>{ [x](Stream<A> xs) {
+        return many >>= [x](Stream<A> xs) {
             return Result(Stream<A>{ x, xs });
-        }});
-    } });
+        };
+    };
 }
 
 template <typename A, typename B, typename C>
 Parser<B> Bracket(Parser<A> open, Parser<B> p, Parser<C> close)
 {
-    return Bind(open, ParserLambda<B, A>{ [p, close](A) {
-        return Bind(p, ParserLambda<B, B>{ [close](B x) {
-            return Bind(close, ParserLambda<B, C>{ [x](C) {
+    return open >>= [p, close](A) {
+        return p >>= [close](B x) {
+            return close >>= [x](C) {
                 return Result(x);
-            } });
-        } });
-    } });
+            };
+        };
+    };
 }
 
 Parser<Stream<int>> Ints()
@@ -377,9 +342,9 @@ Parser<B> Ops(Stream<std::tuple<Parser<A>, B>> xs)
         Fmap(xs, [xs](std::tuple<Parser<A>, B> t) {
             auto const& [p, op] { t };
 
-            return Bind(p, ParserLambda<B, A>{ [op](A) {
+            return p >>= [op](A) {
                 return Result(op);
-            } });
+            };
         })
     };
 
@@ -399,11 +364,11 @@ std::function<Parser<A>(A)> Rest(Parser<A> p, Parser<std::function<A(A, A)>> con
 {
     return [p, op](A x) {
         return Plus(
-            Bind(op, ParserLambda<A, std::function<A(A, A)>>{ [p, op, x](std::function<A(A, A)> const& f) {
-                return Bind(p, ParserLambda<A, A>{ [p, op, x, f](A y) {
+            op >>= [p, op, x](std::function<A(A, A)> const& f) {
+                return p >>= [p, op, x, f](A y) {
                     return Rest(p, op)(f(x, y));
-                } });
-            } }),
+                };
+            },
             Result(x)
         );
     };
@@ -412,7 +377,7 @@ std::function<Parser<A>(A)> Rest(Parser<A> p, Parser<std::function<A(A, A)>> con
 template <typename A>
 Parser<A> Chainl1(Parser<A> p, Parser<std::function<A(A, A)>> const& op)
 {
-    return Bind(p, Rest(p, op));
+    return p >>= Rest(p, op);
 }
 
 Parser<int> Nat()
@@ -420,9 +385,9 @@ Parser<int> Nat()
     std::function<int(int, int)> op{ [](int m, int n) { return 10 * m + n; } };
 
     return Chainl1(
-        Bind(Digit(), ParserLambda<int, wchar_t>{ [](wchar_t x) {
+        Digit() >>= [](wchar_t x) {
             return Result(x - L'0');
-            } }),
+        },
         Result(op)
     );
 }
@@ -430,16 +395,16 @@ Parser<int> Nat()
 template <typename A>
 Parser<A> Chainr1(Parser<A> p, Parser<std::function<A(A, A)>> const& op)
 {
-    return Bind(p, ParserLambda<A, A>{ [p, op](A x) {
+    return p >>= [p, op](A x) {
         return Plus(
-            Bind(op, ParserLambda<A, std::function<A(A, A)>>{ [p, op, x](std::function<A(A, A)> const& f) {
-                return Bind(Chainr1(p, op), ParserLambda<A, A>{ [f, x](A y) {
+            op >>= [p, op, x](std::function<A(A, A)> const& f) {
+                return Chainr1(p, op) >>= [f, x](A y) {
                     return Result(f(x, y));
-                } });
-            } }),
+                };
+            },
             Result(x)
         );
-    } });
+    };
 }
 
 Parser<int> Term(int stack_overflow);
@@ -523,11 +488,11 @@ template <typename A>
 Parser<Stream<A>> Many(Parser<A> p)
 {
     return Force(Plus(
-        Bind(p, ParserLambda<Stream<A>, A>{ [p](A x) {
-            return Bind(Many(p), ParserLambda<Stream<A>, Stream<A>>{ [x](Stream<A> xs) {
+        p >>= [p](A x) {
+            return Many(p) >>= [x](Stream<A> xs) {
                 return Result(Stream<A>{ x, xs });
-            } });
-        } }),
+            };
+        },
         Result(Stream<A>{})
     ));
 }
@@ -570,45 +535,45 @@ Parser<std::tuple<>> Spaces()
 {
     auto is_space{ [](wchar_t x) { return x == L' ' or x == L'\n' or x == L'\t'; } };
 
-    return Bind(Many1(Sat(is_space)), ParserLambda<std::tuple<>, Stream<wchar_t>>{ [](Stream<wchar_t>) {
+    return Many1(Sat(is_space)) >>= [](Stream<wchar_t>) {
         return Result(std::tuple<>{});
-    } });
+    };
 }
 
 Parser<std::tuple<>> Comment()
 {
-    return Bind(String(L"--"), ParserLambda<std::tuple<>, std::wstring>{ [](std::wstring) {
-        return Bind(Many(Sat([](wchar_t x) { return x != L'\n'; })), ParserLambda<std::tuple<>, Stream<wchar_t>>{ [](Stream<wchar_t>) {
+    return String(L"--") >>= [](std::wstring) {
+        return Many(Sat([](wchar_t x) { return x != L'\n'; })) >>= [](Stream<wchar_t>) {
             return Result(std::tuple<>{});
-        } });
-    } });
+        };
+    };
 }
 
 Parser<std::tuple<>> Junk()
 {
-    return Bind(Many(PlusPlusPlus(Spaces(), Comment())), ParserLambda<std::tuple<>, Stream<std::tuple<>>>{ [](Stream<std::tuple<>>) {
+    return Many(PlusPlusPlus(Spaces(), Comment())) >>= [](Stream<std::tuple<>>) {
         return Result(std::tuple<>{});
-    } });
+    };
 }
 
 template <typename A>
 Parser<A> Parse(Parser<A> p)
 {
-    return Bind(Junk(), ParserLambda<A, std::tuple<>>{ [](std::tuple<>) {
-        return Bind(p, ParserLambda<A, A>{ [](A v) {
+    return Junk() >>= [](std::tuple<>) {
+        return p >>= [](A v) {
             return Result(v);
-        } });
-    } });
+        };
+    };
 }
 
 template <typename A>
 Parser<A> Token(Parser<A> p)
 {
-    return Bind(p, ParserLambda<A, A>{ [](A v) {
-        return Bind(Junk(), ParserLambda<A, std::tuple<>>{ [v](std::tuple<>) {
+    return p >>= [](A v) {
+        return Junk() >>= [v](std::tuple<>) {
             return Result(v);
-        } });
-    } });
+        };
+    };
 }
 
 Parser<int> Natural()
@@ -629,7 +594,7 @@ Parser<std::wstring> Symbol(std::wstring xs)
 Parser<std::wstring> Identifier(Stream<std::wstring> ks)
 {
     return Token(
-        Bind(Ident(), ParserLambda<std::wstring, Stream<wchar_t>>{ [ks](Stream<wchar_t> x) {
+        Ident() >>= [ks](Stream<wchar_t> x) {
             std::wstring x_str;
 
             while (!x.IsEmpty())
@@ -642,25 +607,22 @@ Parser<std::wstring> Identifier(Stream<std::wstring> ks)
             return std::ranges::any_of(ks, std::bind_front(std::equal_to<>{}, x_str))
                 ? Result(L""s)
                 : Result(x_str);
-        } })
+        }
     );
 }
 
 Parser<int> Eval()
 {
-    return Bind(Nat(), ParserLambda<int, int>{ [](int x) {
-        return Bind(
-            Ops(Stream<std::tuple<Parser<wchar_t>, std::function<int(int, int)>>>{
+    return Nat() >>= [](int x) {
+        return Ops(Stream<std::tuple<Parser<wchar_t>, std::function<int(int, int)>>>{
                 std::tuple<Parser<wchar_t>, std::function<int(int, int)>>{ Char(L'+'), std::plus<int>{} },
                 std::tuple<Parser<wchar_t>, std::function<int(int, int)>>{ Char(L'-'), std::minus<int>{} }
-            }), 
-            ParserLambda<int, std::function<int(int, int)>>{ [x](std::function<int(int, int)> f) {
-                return Bind(Nat(), ParserLambda<int, int>{ [x, f](int y) {
+            }) >>= [x](std::function<int(int, int)> f) {
+                return Nat() >>= [x, f](int y) {
                     return Result(f(x, y));
-                } });
-            } }
-        );
-    } });
+                };
+            };
+        };
 }
 
 void Eval(std::wstring_view inp)
@@ -762,39 +724,39 @@ Parser<Expression> Atom(int so)
 
 Parser<Expression> Lam(int so)
 {
-    return Bind(Symbol(L"\\"), ParserLambda<Expression, std::wstring>{ [so](std::wstring) {
-        return Bind(Variable(), ParserLambda<Expression, std::wstring>{ [so](std::wstring x) {
-            return Bind(Symbol(L"->"), ParserLambda<Expression, std::wstring>{ [x, so](std::wstring) {
-                return Bind(Expr2(so), ParserLambda<Expression, Expression>{ [x](Expression e) {
+    return Symbol(L"\\") >>= [so](std::wstring) {
+        return Variable() >>= [so](std::wstring x) {
+            return Symbol(L"->") >>= [x, so](std::wstring) {
+                return Expr2(so) >>= [x](Expression e) {
                     return Result<Expression>(std::make_shared<LambdaType>(x, e));
-                    } });
-                } });
-            } });
-        } });
+                };
+            };
+        };
+    };
 }
 
 Parser<Expression> Local(int so)
 {
-    return Bind(Symbol(L"let"), ParserLambda<Expression, std::wstring>{ [so](std::wstring) {
-        return Bind(Variable(), ParserLambda<Expression, std::wstring>{ [so](std::wstring x) {
-            return Bind(Symbol(L"="), ParserLambda<Expression, std::wstring>{ [x, so](std::wstring) {
-                return Bind(Expr2(so), ParserLambda<Expression, Expression>{ [x, so](Expression e) {
-                    return Bind(Symbol(L"in"), ParserLambda<Expression, std::wstring>{ [x, e, so](std::wstring) {
-                        return Bind(Expr2(so), ParserLambda<Expression, Expression>{ [x, e](Expression e2) {
+    return Symbol(L"let") >>= [so](std::wstring) {
+        return Variable() >>= [so](std::wstring x) {
+            return Symbol(L"=") >>= [x, so](std::wstring) {
+                return Expr2(so) >>= [x, so](Expression e) {
+                    return Symbol(L"in") >>= [x, e, so](std::wstring) {
+                        return Expr2(so) >>= [x, e](Expression e2) {
                             return Result<Expression>(std::make_shared<LetType>(x, e, e2));
-                            } });
-                        } });
-                    } });
-                } });
-            } });
-        } });
+                        };
+                    };
+                };
+            };
+        };
+    };
 }
 
 Parser<Expression> Var()
 {
-    return Bind(Variable(), ParserLambda<Expression, std::wstring>{ [](std::wstring x) {
+    return Variable() >>= [](std::wstring x) {
         return Result<Expression>(std::make_shared<VariableType>(x));
-    } });
+    };
 }
 
 Parser<Expression> Paren(int so)
@@ -866,26 +828,26 @@ struct std::formatter<Expression, wchar_t>
 
 int main()
 {
-    //Show(Word()(L"Yes!"));
-    //Show(String(L"hello")(L"hello there"));
-    //Show(String(L"hello")(L"helicopter"));
-    //Show(Many(Digit())(L"1234a567"));
-    //Show(Many(Char(L' '))(L"    Trim"));
-    //Show(Nat()(L"12345a"));
-    //Show(Int()(L"-12345a"));
-    //Show(Ints()(L"[1,2,3,4,5]"));
-    //Show(Expr()(L"1+2-(3+4)"));
-    //Show(Eval()(L"1+2-(3+4)"));
-    //Show(Number()(L"hello"));
-    //Show(Number()(L"123"));
-    //Show(Colour()(L"yellook"));
-    //Show(Identifier({ L"auto"s, L"int"s })(L"int"));
-    //Show(Identifier({ L"auto"s, L"int"s })(L"atou"));
-    //Show(Identifier({ L"auto"s, L"int"s })(L"auto"));
-    //
-    //Eval(L"(5+(3-1))+((7-2)^10+(4+2))-(8-3)^2");
+    std::wcout << std::format(L"{}\n", Triples().Take(20));
 
-    //Show(Local(10)(L"let a = 2 in a + 2"));
+    Show(Word()(L"Yes!"));
+    Show(String(L"hello")(L"hello there"));
+    Show(String(L"hello")(L"helicopter"));
+    Show(Many(Digit())(L"1234a567"));
+    Show(Many(Char(L' '))(L"    Trim"));
+    Show(Nat()(L"12345a"));
+    Show(Int()(L"-12345a"));
+    Show(Ints()(L"[1,2,3,4,5]"));
+    Show(Expr()(L"1+2-(3+4)"));
+    Show(Eval()(L"1+2-(3+4)"));
+    Show(Number()(L"hello"));
+    Show(Number()(L"123"));
+    Show(Colour()(L"yellook"));
+    Show(Identifier({ L"auto"s, L"int"s })(L"int"));
+    Show(Identifier({ L"auto"s, L"int"s })(L"atou"));
+    Show(Identifier({ L"auto"s, L"int"s })(L"auto"));
+    
+    Eval(L"(5+(3-1))+((7-2)^10+(4+2))-(8-3)^2");
 
     Show(Expr2(10)(L"\\x -> let a = test in hahaha"));
 

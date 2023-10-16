@@ -18,13 +18,11 @@
     <ClCompile Include="monadic_parser_combinators.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="generator.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="LazyStream.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
+    <ClCompile Include="Stream.ixx">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Parser.ixx">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>
