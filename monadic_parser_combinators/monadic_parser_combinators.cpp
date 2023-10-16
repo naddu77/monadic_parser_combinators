@@ -9,6 +9,8 @@
 #include <iostream>
 #include <numeric>
 #include <algorithm>
+#include <variant>
+#include <memory>
 #include "generator.h"
 
 using namespace std::literals;
@@ -638,8 +640,8 @@ Parser<std::wstring> Identifier(Stream<std::wstring> ks)
             }
 
             return std::ranges::any_of(ks, std::bind_front(std::equal_to<>{}, x_str))
-                ? Result(x_str)
-                : Result(L""s);
+                ? Result(L""s)
+                : Result(x_str);
         } })
     );
 }
@@ -666,24 +668,226 @@ void Eval(std::wstring_view inp)
     Show(First(Expr())(inp));
 }
 
+class ApplicationType;
+class LambdaType;
+class LetType;
+class VariableType;
+
+class Expression
+{
+public:
+    Expression() = default;
+
+    template <typename T>
+    Expression(T t)
+        : v{ t }
+    {
+
+    }
+
+    std::variant<
+        std::monostate,
+        std::shared_ptr<ApplicationType>,
+        std::shared_ptr<LambdaType>,
+        std::shared_ptr<LetType>,
+        std::shared_ptr<VariableType>
+    > v;
+};
+
+class ApplicationType
+{
+public:
+    Expression e1;
+    Expression e2;
+};
+
+class LambdaType
+{
+public:
+    std::wstring x;
+    Expression e;
+};
+
+class LetType
+{
+public:
+    std::wstring x;
+    Expression e1;
+    Expression e2;
+};
+
+class VariableType
+{
+public:
+    std::wstring x;
+};
+
+Parser<Expression> Atom(int so);
+Parser<Expression> Lam(int so);
+Parser<Expression> Local(int so);
+Parser<Expression> Var();
+Parser<Expression> Paren(int so);
+Parser<std::wstring> Variable();
+Parser<Expression> Expr2(int so);
+
+Parser<std::function<Expression(Expression, Expression)>> Apps(int so)
+{
+    return Ops(Stream<std::tuple<Parser<Expression>, std::function<Expression(Expression, Expression)>>>{
+        std::tuple<Parser<Expression>, std::function<Expression(Expression, Expression)>>{ Expr2(so), [](Expression e1, Expression e2) {
+            return std::make_shared<ApplicationType>(e1, e2);
+        } } 
+    });
+}
+
+Parser<Expression> Expr2(int so)
+{
+    if (so <= 0)
+    {
+        return Zero<Expression>();
+    }
+
+    return Chainl1(Atom(so - 1), Apps(so - 1));
+}
+
+Parser<Expression> Atom(int so)
+{
+    return PlusPlusPlus(
+        PlusPlusPlus(
+            PlusPlusPlus(Lam(so - 1), Local(so - 1)),
+            Var()
+        ),
+        Paren(so - 1)
+    );
+}
+
+Parser<Expression> Lam(int so)
+{
+    return Bind(Symbol(L"\\"), ParserLambda<Expression, std::wstring>{ [so](std::wstring) {
+        return Bind(Variable(), ParserLambda<Expression, std::wstring>{ [so](std::wstring x) {
+            return Bind(Symbol(L"->"), ParserLambda<Expression, std::wstring>{ [x, so](std::wstring) {
+                return Bind(Expr2(so), ParserLambda<Expression, Expression>{ [x](Expression e) {
+                    return Result<Expression>(std::make_shared<LambdaType>(x, e));
+                    } });
+                } });
+            } });
+        } });
+}
+
+Parser<Expression> Local(int so)
+{
+    return Bind(Symbol(L"let"), ParserLambda<Expression, std::wstring>{ [so](std::wstring) {
+        return Bind(Variable(), ParserLambda<Expression, std::wstring>{ [so](std::wstring x) {
+            return Bind(Symbol(L"="), ParserLambda<Expression, std::wstring>{ [x, so](std::wstring) {
+                return Bind(Expr2(so), ParserLambda<Expression, Expression>{ [x, so](Expression e) {
+                    return Bind(Symbol(L"in"), ParserLambda<Expression, std::wstring>{ [x, e, so](std::wstring) {
+                        return Bind(Expr2(so), ParserLambda<Expression, Expression>{ [x, e](Expression e2) {
+                            return Result<Expression>(std::make_shared<LetType>(x, e, e2));
+                            } });
+                        } });
+                    } });
+                } });
+            } });
+        } });
+}
+
+Parser<Expression> Var()
+{
+    return Bind(Variable(), ParserLambda<Expression, std::wstring>{ [](std::wstring x) {
+        return Result<Expression>(std::make_shared<VariableType>(x));
+    } });
+}
+
+Parser<Expression> Paren(int so)
+{
+    return Bracket(Symbol(L"("), Expr2(so), Symbol(L")"));
+}
+
+Parser<std::wstring> Variable()
+{
+    return Identifier({ L"let"s, L"in"s });
+}
+
+template <>
+struct std::formatter<Expression, wchar_t>
+{
+    template <typename FormatContext>
+    auto format(Expression const& v, FormatContext& ctx) const
+    {
+        auto out{ ctx.out() };
+
+        struct Visitor
+        {
+            void operator()(std::monostate const& mono)
+            {
+                out = std::format_to(out, L"Mono");
+            }
+
+            void operator()(std::shared_ptr<ApplicationType> const& app)
+            {
+                out = std::format_to(out, L"App({},{})", app->e1, app->e2);
+            }
+
+            void operator()(std::shared_ptr<LambdaType> const& lam)
+            {
+                out = std::format_to(out, L"Lam({},{})", lam->x, lam->e);
+            }
+
+            void operator()(std::shared_ptr<LetType> const& let)
+            {
+                out = std::format_to(out, L"Let({},{},{})", let->x, let->e1, let->e2);
+            }
+
+            void operator()(std::shared_ptr<VariableType> const& var)
+            {
+                out = std::format_to(out, L"Var({})", var->x);
+            }
+
+            decltype(out) out;
+        };
+
+        std::visit(Visitor{ out }, v.v);
+
+        return out;
+    }
+
+    constexpr auto parse(std::wformat_parse_context& ctx) -> decltype(std::begin(ctx))
+    {
+        auto it{ std::begin(ctx) };
+        auto e_it{ std::end(ctx) };
+
+        if (it != e_it and *it != L'}')
+        {
+            throw std::format_error{ "ivalid format" };
+        }
+
+        return it;
+    }
+};
+
 int main()
 {
-    Show(Word()(L"Yes!"));
-    Show(String(L"hello")(L"hello there"));
-    Show(String(L"hello")(L"helicopter"));
-    Show(Many(Digit())(L"1234a567"));
-    Show(Many(Char(L' '))(L"    Trim"));
-    Show(Nat()(L"12345a"));
-    Show(Int()(L"-12345a"));
-    Show(Ints()(L"[1,2,3,4,5]"));
-    Show(Expr()(L"1+2-(3+4)"));
-    Show(Eval()(L"1+2-(3+4)"));
-    Show(Number()(L"hello"));
-    Show(Number()(L"123"));
-    Show(Colour()(L"yellook"));
-    Show(Identifier({ L"auto"s, L"int"s })(L"int"));
-    Show(Identifier({ L"auto"s, L"int"s })(L"atou"));
-    Show(Identifier({ L"auto"s, L"int"s })(L"auto"));
-    
-    Eval(L"(5+(3-1))+((7-2)^10+(4+2))-(8-3)^2");
+    //Show(Word()(L"Yes!"));
+    //Show(String(L"hello")(L"hello there"));
+    //Show(String(L"hello")(L"helicopter"));
+    //Show(Many(Digit())(L"1234a567"));
+    //Show(Many(Char(L' '))(L"    Trim"));
+    //Show(Nat()(L"12345a"));
+    //Show(Int()(L"-12345a"));
+    //Show(Ints()(L"[1,2,3,4,5]"));
+    //Show(Expr()(L"1+2-(3+4)"));
+    //Show(Eval()(L"1+2-(3+4)"));
+    //Show(Number()(L"hello"));
+    //Show(Number()(L"123"));
+    //Show(Colour()(L"yellook"));
+    //Show(Identifier({ L"auto"s, L"int"s })(L"int"));
+    //Show(Identifier({ L"auto"s, L"int"s })(L"atou"));
+    //Show(Identifier({ L"auto"s, L"int"s })(L"auto"));
+    //
+    //Eval(L"(5+(3-1))+((7-2)^10+(4+2))-(8-3)^2");
+
+    //Show(Local(10)(L"let a = 2 in a + 2"));
+
+    Show(Expr2(10)(L"\\x -> let a = test in hahaha"));
+
+    return 0;
 }
